@@ -38,9 +38,9 @@
  */
 
 // Constants
-constexpr int TILE_BR = 128;
-constexpr int TILE_BC = 128;
-constexpr int HEAD_DIM = 128;
+constexpr int TILE_BR = 64;
+constexpr int TILE_BC = 64;
+constexpr int HEAD_DIM = 64;
 
 // Tile Loading
 __device__ void load_Q_tile(const float* Q, float smem[TILE_BR][HEAD_DIM], int tile_idx, int N, int d);
