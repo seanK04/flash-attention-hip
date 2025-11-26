@@ -43,9 +43,48 @@ constexpr int TILE_BC = 64;
 constexpr int HEAD_DIM = 64;
 
 // Tile Loading
-__device__ void load_Q_tile(const float* Q, float smem[TILE_BR][HEAD_DIM], int tile_idx, int N, int d);
-__device__ void load_K_tile(const float* K, float smem[TILE_BC][HEAD_DIM], int tile_idx, int N, int d);
-__device__ void load_V_tile(const float* V, float smem[TILE_BC][HEAD_DIM], int tile_idx, int N, int d);
+__device__ void load_Q_tile(const float* Q, float smem[TILE_BR][HEAD_DIM], int tile_idx, int N, int d) {
+    int row = tile_idx * TILE_BR + threadIdx.x;
+    
+    if (row < N && threadIdx.x < TILE_BR) {
+        for (int col = 0; col < d; col++) {
+            smem[threadIdx.x][col] = Q[row * d + col];
+        }
+    } else if (threadIdx.x < TILE_BR) {
+        // Pad with zeros if out of bounds
+        for (int col = 0; col < d; col++) {
+            smem[threadIdx.x][col] = 0.0f;
+        }
+    }
+}
+__device__ void load_K_tile(const float* K, float smem[TILE_BC][HEAD_DIM], int tile_idx, int N, int d) {
+    int row = tile_idx * TILE_BC + threadIdx.x;
+    
+    if (row < N && threadIdx.x < TILE_BC) {
+        for (int col = 0; col < d; col++) {
+            smem[threadIdx.x][col] = K[row * d + col];
+        }
+    } else if (threadIdx.x < TILE_BC) {
+        // Pad with zeros if out of bounds
+        for (int col = 0; col < d; col++) {
+            smem[threadIdx.x][col] = 0.0f;
+        }
+    }
+}
+__device__ void load_V_tile(const float* V, float smem[TILE_BC][HEAD_DIM], int tile_idx, int N, int d) {
+    int row = tile_idx * TILE_BC + threadIdx.x;
+    
+    if (row < N && threadIdx.x < TILE_BC) {
+        for (int col = 0; col < d; col++) {
+            smem[threadIdx.x][col] = V[row * d + col];
+        }
+    } else if (threadIdx.x < TILE_BC) {
+        // Pad with zeros if out of bounds
+        for (int col = 0; col < d; col++) {
+            smem[threadIdx.x][col] = 0.0f;
+        }
+    }
+}
 
 // Matmul
 __device__ void matmul_QKt(float Q[TILE_BR][HEAD_DIM], float K[TILE_BC][HEAD_DIM], float S[TILE_BR][TILE_BC]);
