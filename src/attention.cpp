@@ -116,14 +116,12 @@ __device__ void matmul_QKt(float Q[TILE_BR][HEAD_DIM], float K[TILE_BC][HEAD_DIM
         for (int i = 0; i < THREAD_TILE_M; i++) {
             q_vals[i] = Q[row_start + i][k];
         }
-
         // Load K values for this thread's columns at column k
         float k_vals[THREAD_TILE_N];
         #pragma unroll
         for (int j = 0; j < THREAD_TILE_N; j++) {
             k_vals[j] = K[col_start + j][k];
         }
-
         // Compute outer product contribution to the 4×4 micro-tile
         #pragma unroll
         for (int i = 0; i < THREAD_TILE_M; i++) {
@@ -133,7 +131,6 @@ __device__ void matmul_QKt(float Q[TILE_BR][HEAD_DIM], float K[TILE_BC][HEAD_DIM
             }
         }
     }
-
     // Write the micro-tile results back to shared memory
     #pragma unroll
     for (int i = 0; i < THREAD_TILE_M; i++) {
@@ -166,8 +163,20 @@ __device__ float row_sum_exp(float S[TILE_BR][TILE_BC], int row, float max_val);
 __device__ void softmax_rescale(float O[THREAD_TILE_M][HEAD_DIM], float m_old[THREAD_TILE_M], float l_old[THREAD_TILE_M], float m_new[THREAD_TILE_M], float l_new[THREAD_TILE_M]);
 __device__ void softmax_update(float m[THREAD_TILE_M], float l[THREAD_TILE_M], float m_new[THREAD_TILE_M], float l_new[THREAD_TILE_M]);
 
-// Output (TODO: implement with 2D threading)
-__device__ void store_O(float* O, float reg_O[THREAD_TILE_M][HEAD_DIM], float l[THREAD_TILE_M], int q_tile, int N, int d);
+// Output
+__device__ void store_O(float* O, float reg_O[THREAD_TILE_M][HEAD_DIM], float l[THREAD_TILE_M], int q_tile, int N, int d) {
+    int row_start = q_tile * TILE_BR + threadIdx.y *THREAD_TILE_M;
+
+    for (int i = 0; i < THREAD_TILE_M; i++) {
+        int row = row_start + i; 
+        if (row < N) {
+            for (int j = 0; j < HEAD_DIM; j++) {
+                // Normalize by softmax sum and write
+                O[row * d + j] = reg_O[i][j] / l[i];
+            }
+        }
+    }
+}
 
 // Main Kernel
 __global__ void flash_attention_kernel(const float* Q, const float* K, const float* V, float* O, int N, int d) {
