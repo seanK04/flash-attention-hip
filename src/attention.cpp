@@ -141,38 +141,48 @@ __device__ void matmul_QKt(float Q[TILE_BR][HEAD_DIM], float K[TILE_BC][HEAD_DIM
     }
 }
 
-__device__ void matmul_PV(float P[TILE_BR][TILE_BC], float V[TILE_BC][HEAD_DIM], float O[THREAD_TILE_M][HEAD_DIM]) {
+__device__ void matmul_PV(float P[TILE_BR][TILE_BC], float V[TILE_BC][HEAD_DIM], float O[THREAD_TILE_M][THREAD_TILE_N]) {
     int row_start = threadIdx.y * THREAD_TILE_M;
-
-    // Each thread handles THREAD_TILE_M rows x HEAD_DIM columns
-    for (int i = 0; i < THREAD_TILE_M; i++) {
-        for (int d = 0; d < HEAD_DIM; d++) {
-            float sum = 0.0f;
-            // Reduction over TILE_BC
-            for (int j = 0; j < TILE_BC; j++) {
-                sum += P[row_start + i][j] * V[j][d];
+    int col_start = threadIdx.x * THREAD_TILE_N;
+    #pragma unroll
+    for (int k = 0; k < TILE_BC; k++) {
+        float p_vals[THREAD_TILE_M];
+        #pragma unroll
+        for (int i = 0; i < THREAD_TILE_M; i++) {
+            p_vals[i] = P[row_start + i][k];
+        }
+        float v_vals[THREAD_TILE_N];
+        #pragma unroll
+        for (int j = 0; j < THREAD_TILE_N; j++) {
+            v_vals[j] = V[k][col_start + j];
+        }
+        #pragma unroll
+        for (int i = 0; i < THREAD_TILE_M; i++) {
+            #pragma unroll
+            for (int j = 0; j < THREAD_TILE_N; j++) {
+                O[i][j] += p_vals[i] * v_vals[j];
             }
-            O[i][d] += sum; // Accumulate
         }
     }
 }
 
+
 // Online Softmax (TODO: implement with per-thread-tile operations)
 __device__ float row_max(float S[TILE_BR][TILE_BC], int row);
 __device__ float row_sum_exp(float S[TILE_BR][TILE_BC], int row, float max_val);
-__device__ void softmax_rescale(float O[THREAD_TILE_M][HEAD_DIM], float m_old[THREAD_TILE_M], float l_old[THREAD_TILE_M], float m_new[THREAD_TILE_M], float l_new[THREAD_TILE_M]);
+__device__ void softmax_rescale(float O[THREAD_TILE_M][THREAD_TILE_N], float m_old[THREAD_TILE_M], float l_old[THREAD_TILE_M], float m_new[THREAD_TILE_M], float l_new[THREAD_TILE_M]);
 __device__ void softmax_update(float m[THREAD_TILE_M], float l[THREAD_TILE_M], float m_new[THREAD_TILE_M], float l_new[THREAD_TILE_M]);
 
 // Output
-__device__ void store_O(float* O, float reg_O[THREAD_TILE_M][HEAD_DIM], float l[THREAD_TILE_M], int q_tile, int N, int d) {
-    int row_start = q_tile * TILE_BR + threadIdx.y *THREAD_TILE_M;
+__device__ void store_O(float* O, float reg_O[THREAD_TILE_M][THREAD_TILE_N], float l[THREAD_TILE_M], int q_tile, int N, int d) {
+    int row_start = q_tile * TILE_BR + threadIdx.y * THREAD_TILE_M;
+    int col_start = threadIdx.x * THREAD_TILE_N;
 
     for (int i = 0; i < THREAD_TILE_M; i++) {
         int row = row_start + i; 
         if (row < N) {
-            for (int j = 0; j < HEAD_DIM; j++) {
-                // Normalize by softmax sum and write
-                O[row * d + j] = reg_O[i][j] / l[i];
+            for (int j = 0; j < THREAD_TILE_N; j++) {
+                O[row * d + col_start + j] = reg_O[i][j] / l[i];
             }
         }
     }
@@ -186,7 +196,7 @@ __global__ void flash_attention_kernel(const float* Q, const float* K, const flo
     __shared__ float smem_S[TILE_BR][TILE_BC];
     
     // Each thread accumulates THREAD_TILE_M rows of output
-    float reg_O[THREAD_TILE_M][HEAD_DIM] = {0};
+    float reg_O[THREAD_TILE_M][THREAD_TILE_N] = {0};
     float m[THREAD_TILE_M];
     float l[THREAD_TILE_M];
     
