@@ -96,9 +96,69 @@ __device__ void load_V_tile(const float* V, float smem[TILE_BC][HEAD_DIM], int t
     }
 }
 
-// Matmul (TODO: implement with 2D threading)
-__device__ void matmul_QKt(float Q[TILE_BR][HEAD_DIM], float K[TILE_BC][HEAD_DIM], float S[TILE_BR][TILE_BC]);
-__device__ void matmul_PV(float P[TILE_BR][TILE_BC], float V[TILE_BC][HEAD_DIM], float O[THREAD_TILE_M][HEAD_DIM]);
+// Matmul
+__device__ void matmul_QKt(float Q[TILE_BR][HEAD_DIM], float K[TILE_BC][HEAD_DIM], float S[TILE_BR][TILE_BC]) {
+    // Thread (tx, ty) handles:
+    //  Rows: [ty * THREAD_TILE_M, ty * THREAD_TILE_M + THREAD_TILE_M]
+    //  Cols: [tx * THREAD_TILE_N, tx * THREAD_TILE_N + THREAD_TILE_N]
+    
+    int row_start = threadIdx.y * THREAD_TILE_M;
+    int col_start = threadIdx.x * THREAD_TILE_N;
+
+    float acc[THREAD_TILE_M][THREAD_TILE_N] = {0};
+
+    // Loop over the reduction dimension: S[i,j] = sum_k Q[i,k] * K[j,k]
+    #pragma unroll
+    for (int k = 0; k < HEAD_DIM; k++) {
+        // Load Q values for this thread's rows at column k
+        float q_vals[THREAD_TILE_M];
+        #pragma unroll
+        for (int i = 0; i < THREAD_TILE_M; i++) {
+            q_vals[i] = Q[row_start + i][k];
+        }
+
+        // Load K values for this thread's columns at column k
+        float k_vals[THREAD_TILE_N];
+        #pragma unroll
+        for (int j = 0; j < THREAD_TILE_N; j++) {
+            k_vals[j] = K[col_start + j][k];
+        }
+
+        // Compute outer product contribution to the 4×4 micro-tile
+        #pragma unroll
+        for (int i = 0; i < THREAD_TILE_M; i++) {
+            #pragma unroll
+            for (int j = 0; j < THREAD_TILE_N; j++) {
+                acc[i][j] += q_vals[i] * k_vals[j];
+            }
+        }
+    }
+
+    // Write the micro-tile results back to shared memory
+    #pragma unroll
+    for (int i = 0; i < THREAD_TILE_M; i++) {
+        #pragma unroll
+        for (int j = 0; j < THREAD_TILE_N; j++) {
+            S[row_start + i][col_start + j] = acc[i][j];
+        }
+    }
+}
+
+__device__ void matmul_PV(float P[TILE_BR][TILE_BC], float V[TILE_BC][HEAD_DIM], float O[THREAD_TILE_M][HEAD_DIM]) {
+    int row_start = threadIdx.y * THREAD_TILE_M;
+
+    // Each thread handles THREAD_TILE_M rows x HEAD_DIM columns
+    for (int i = 0; i < THREAD_TILE_M; i++) {
+        for (int d = 0; d < HEAD_DIM; d++) {
+            float sum = 0.0f;
+            // Reduction over TILE_BC
+            for (int j = 0; j < TILE_BC; j++) {
+                sum += P[row_start + i][j] * V[j][d];
+            }
+            O[i][d] += sum; // Accumulate
+        }
+    }
+}
 
 // Online Softmax (TODO: implement with per-thread-tile operations)
 __device__ float row_max(float S[TILE_BR][TILE_BC], int row);
@@ -155,6 +215,6 @@ __global__ void flash_attention_kernel(const float* Q, const float* K, const flo
 // Host
 void flash_attention_forward(const float* Q, const float* K, const float* V, float* O, int N, int d) {
     dim3 grid((N + TILE_BR - 1) / TILE_BR);
-    dim3 block(THREADS_X, THREADS_Y);  // 16×16 = 256 threads per block
+    dim3 block(THREADS_X, THREADS_Y);  // 16x16 = 256 threads per block
     hipLaunchKernelGGL(flash_attention_kernel, grid, block, 0, 0, Q, K, V, O, N, d);
 }
