@@ -168,10 +168,40 @@ __device__ void matmul_PV(float P[TILE_BR][TILE_BC], float V[TILE_BC][HEAD_DIM],
 
 
 // Online Softmax (TODO: implement with per-thread-tile operations)
-__device__ float row_max(float S[TILE_BR][TILE_BC], int row);
-__device__ float row_sum_exp(float S[TILE_BR][TILE_BC], int row, float max_val);
-__device__ void softmax_rescale(float O[THREAD_TILE_M][THREAD_TILE_N], float m_old[THREAD_TILE_M], float l_old[THREAD_TILE_M], float m_new[THREAD_TILE_M], float l_new[THREAD_TILE_M]);
-__device__ void softmax_update(float m[THREAD_TILE_M], float l[THREAD_TILE_M], float m_new[THREAD_TILE_M], float l_new[THREAD_TILE_M]);
+__device__ float row_max(float S[TILE_BR][TILE_BC], int row) {
+    float max_val = -INFINITY;
+    for (int j = 0; j < TILE_BC; j++) {
+        max_val = fmaxf(max_val, S[row][j]);
+    }
+    return max_val;
+}
+__device__ float row_sum_exp(float S[TILE_BR][TILE_BC], int row, float max_val) {
+    float l = 0.0f;
+    for (int j = 0; j < TILE_BC; j++) {
+        float val = expf(S[row][j] - max_val);
+        // Write back to S to save re-computation for P @ V
+        // This effectively turns S into P (not normalized) in shared mem
+        S[row][j] = val; 
+        l += val;
+
+    }
+}
+__device__ void softmax_rescale(float O[THREAD_TILE_M][THREAD_TILE_N], float m_old[THREAD_TILE_M], float l_old[THREAD_TILE_M], float m_new[THREAD_TILE_M], float l_new[THREAD_TILE_M]) {
+    for (int i = 0; i < THREAD_TILE_M; i++) {
+        float scale = expf(m_old[i] - m_new[i]);
+        for (int j = 0; j < THREAD_TILE_N; j++) {
+            O[i][j] *= scale;
+        }
+    }
+}
+__device__ void softmax_update(float m[THREAD_TILE_M], float l[THREAD_TILE_M], float m_new[THREAD_TILE_M], float l_new[THREAD_TILE_M]) {
+    for (int i = 0; i < THREAD_TILE_M; i++) {
+        //combine local sum of current block with the old running sum
+        float scale = expf(m[i] - m_new[i]);
+        l[i] = l[i] * scale + l_new[i];
+        m[i] = m_new[i];
+    }
+}
 
 // Output
 __device__ void store_O(float* O, float reg_O[THREAD_TILE_M][THREAD_TILE_N], float l[THREAD_TILE_M], int q_tile, int N, int d) {
