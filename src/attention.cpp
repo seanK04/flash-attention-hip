@@ -48,6 +48,10 @@ constexpr int THREADS_Y = 16;  // rows
 constexpr int THREAD_TILE_M = TILE_BR / THREADS_Y;  // 4 rows per thread
 constexpr int THREAD_TILE_N = TILE_BC / THREADS_X;  // 4 cols per thread
 
+constexpr int THREAD_TILE_S_COL = TILE_BC / THREADS_X; // 4 cols of S per thread
+constexpr int THREAD_TILE_O_COL = HEAD_DIM / THREADS_X; // 4 cols of O per thread (or 8 if HEAD_DIM=128)
+
+
 // Tile Loading
 __device__ void load_Q_tile(const float* Q, float smem[TILE_BR][HEAD_DIM], int tile_idx, int N, int d) {
     // Each thread loads THREAD_TILE_M rows
@@ -69,13 +73,13 @@ __device__ void load_Q_tile(const float* Q, float smem[TILE_BR][HEAD_DIM], int t
 __device__ void load_K_tile(const float* K, float smem[TILE_BC][HEAD_DIM], int tile_idx, int N, int d) {
     // Each thread loads THREAD_TILE_N rows
     for (int i = 0; i < THREAD_TILE_N; i++) {
-        int row = tile_idx * TILE_BC + threadIdx.x * THREAD_TILE_N + i;
+        int row = tile_idx * TILE_BC + threadIdx.y * THREAD_TILE_N + i;
         
-        for (int j = threadIdx.y; j < d; j += THREADS_Y) {
+        for (int j = threadIdx.x; j < d; j += THREADS_X) {
             if (row < N && j < d) {
-                smem[threadIdx.x * THREAD_TILE_N + i][j] = K[row * d + j];
+                smem[threadIdx.y * THREAD_TILE_N + i][j] = K[row * d + j];
             } else {
-                smem[threadIdx.x * THREAD_TILE_N + i][j] = 0.0f;
+                smem[threadIdx.y * THREAD_TILE_N + i][j] = 0.0f;
             }
         }
     }
@@ -84,13 +88,13 @@ __device__ void load_K_tile(const float* K, float smem[TILE_BC][HEAD_DIM], int t
 __device__ void load_V_tile(const float* V, float smem[TILE_BC][HEAD_DIM], int tile_idx, int N, int d) {
     // Same structure as load_K_tile (V has same dimensions as K)
     for (int i = 0; i < THREAD_TILE_N; i++) {
-        int row = tile_idx * TILE_BC + threadIdx.x * THREAD_TILE_N + i;
+        int row = tile_idx * TILE_BC + threadIdx.y * THREAD_TILE_N + i;
         
-        for (int j = threadIdx.y; j < d; j += THREADS_Y) {
+        for (int j = threadIdx.x; j < d; j += THREADS_X) {
             if (row < N && j < d) {
-                smem[threadIdx.x * THREAD_TILE_N + i][j] = V[row * d + j];
+                smem[threadIdx.y * THREAD_TILE_N + i][j] = V[row * d + j];
             } else {
-                smem[threadIdx.x * THREAD_TILE_N + i][j] = 0.0f;
+                smem[threadIdx.y * THREAD_TILE_N + i][j] = 0.0f;
             }
         }
     }
@@ -141,9 +145,9 @@ __device__ void matmul_QKt(float Q[TILE_BR][HEAD_DIM], float K[TILE_BC][HEAD_DIM
     }
 }
 
-__device__ void matmul_PV(float P[TILE_BR][TILE_BC], float V[TILE_BC][HEAD_DIM], float O[THREAD_TILE_M][THREAD_TILE_N]) {
+__device__ void matmul_PV(float P[TILE_BR][TILE_BC], float V[TILE_BC][HEAD_DIM], float O[THREAD_TILE_M][THREAD_TILE_O_COL]) {
     int row_start = threadIdx.y * THREAD_TILE_M;
-    int col_start = threadIdx.x * THREAD_TILE_N;
+    int col_start = threadIdx.x * THREAD_TILE_O_COL;
     #pragma unroll
     for (int k = 0; k < TILE_BC; k++) {
         float p_vals[THREAD_TILE_M];
@@ -151,15 +155,15 @@ __device__ void matmul_PV(float P[TILE_BR][TILE_BC], float V[TILE_BC][HEAD_DIM],
         for (int i = 0; i < THREAD_TILE_M; i++) {
             p_vals[i] = P[row_start + i][k];
         }
-        float v_vals[THREAD_TILE_N];
+        float v_vals[THREAD_TILE_O_COL];
         #pragma unroll
-        for (int j = 0; j < THREAD_TILE_N; j++) {
+        for (int j = 0; j < THREAD_TILE_O_COL; j++) {
             v_vals[j] = V[k][col_start + j];
         }
         #pragma unroll
         for (int i = 0; i < THREAD_TILE_M; i++) {
             #pragma unroll
-            for (int j = 0; j < THREAD_TILE_N; j++) {
+            for (int j = 0; j < THREAD_TILE_O_COL; j++) {
                 O[i][j] += p_vals[i] * v_vals[j];
             }
         }
@@ -183,13 +187,13 @@ __device__ float row_sum_exp(float S[TILE_BR][TILE_BC], int row, float max_val) 
         // This effectively turns S into P (not normalized) in shared mem
         S[row][j] = val; 
         l += val;
-
     }
+    return l;
 }
-__device__ void softmax_rescale(float O[THREAD_TILE_M][THREAD_TILE_N], float m_old[THREAD_TILE_M], float l_old[THREAD_TILE_M], float m_new[THREAD_TILE_M], float l_new[THREAD_TILE_M]) {
+__device__ void softmax_rescale(float O[THREAD_TILE_M][THREAD_TILE_O_COL], float m_old[THREAD_TILE_M], float m_new[THREAD_TILE_M]) {
     for (int i = 0; i < THREAD_TILE_M; i++) {
         float scale = expf(m_old[i] - m_new[i]);
-        for (int j = 0; j < THREAD_TILE_N; j++) {
+        for (int j = 0; j < THREAD_TILE_O_COL; j++) {
             O[i][j] *= scale;
         }
     }
@@ -204,14 +208,14 @@ __device__ void softmax_update(float m[THREAD_TILE_M], float l[THREAD_TILE_M], f
 }
 
 // Output
-__device__ void store_O(float* O, float reg_O[THREAD_TILE_M][THREAD_TILE_N], float l[THREAD_TILE_M], int q_tile, int N, int d) {
+__device__ void store_O(float* O, float reg_O[THREAD_TILE_M][THREAD_TILE_O_COL], float l[THREAD_TILE_M], int q_tile, int N, int d) {
     int row_start = q_tile * TILE_BR + threadIdx.y * THREAD_TILE_M;
-    int col_start = threadIdx.x * THREAD_TILE_N;
+    int col_start = threadIdx.x * THREAD_TILE_O_COL;
 
     for (int i = 0; i < THREAD_TILE_M; i++) {
         int row = row_start + i; 
         if (row < N) {
-            for (int j = 0; j < THREAD_TILE_N; j++) {
+            for (int j = 0; j < THREAD_TILE_O_COL; j++) {
                 O[row * d + col_start + j] = reg_O[i][j] / l[i];
             }
         }
@@ -226,7 +230,7 @@ __global__ void flash_attention_kernel(const float* Q, const float* K, const flo
     __shared__ float smem_S[TILE_BR][TILE_BC];
     
     // Each thread accumulates THREAD_TILE_M rows of output
-    float reg_O[THREAD_TILE_M][THREAD_TILE_N] = {0};
+    float reg_O[THREAD_TILE_M][THREAD_TILE_O_COL] = {0};
     float m[THREAD_TILE_M];
     float l[THREAD_TILE_M];
     
