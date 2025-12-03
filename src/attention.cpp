@@ -67,15 +67,15 @@ __device__ void load_Q_tile(const float* Q, float smem[TILE_BR][HEAD_DIM], int t
 }
 
 __device__ void load_K_tile(const float* K, float smem[TILE_BC][HEAD_DIM], int tile_idx, int N, int d) {
-    // Each thread loads THREAD_TILE_N rows
-    for (int i = 0; i < THREAD_TILE_N; i++) {
-        int row = tile_idx * TILE_BC + threadIdx.y * THREAD_TILE_N + i;
+    // Each thread loads THREAD_TILE_M rows
+    for (int i = 0; i < THREAD_TILE_M; i++) {
+        int row = tile_idx * TILE_BC + threadIdx.y * THREAD_TILE_M + i;
         
         for (int j = threadIdx.x; j < d; j += THREADS_X) {
             if (row < N && j < d) {
-                smem[threadIdx.y * THREAD_TILE_N + i][j] = K[row * d + j];
+                smem[threadIdx.y * THREAD_TILE_M + i][j] = K[row * d + j];
             } else {
-                smem[threadIdx.y * THREAD_TILE_N + i][j] = 0.0f;
+                smem[threadIdx.y * THREAD_TILE_M + i][j] = 0.0f;
             }
         }
     }
@@ -83,14 +83,14 @@ __device__ void load_K_tile(const float* K, float smem[TILE_BC][HEAD_DIM], int t
 
 __device__ void load_V_tile(const float* V, float smem[TILE_BC][HEAD_DIM], int tile_idx, int N, int d) {
     // Same structure as load_K_tile (V has same dimensions as K)
-    for (int i = 0; i < THREAD_TILE_N; i++) {
-        int row = tile_idx * TILE_BC + threadIdx.y * THREAD_TILE_N + i;
+    for (int i = 0; i < THREAD_TILE_M; i++) {
+        int row = tile_idx * TILE_BC + threadIdx.y * THREAD_TILE_M + i;
         
         for (int j = threadIdx.x; j < d; j += THREADS_X) {
             if (row < N && j < d) {
-                smem[threadIdx.y * THREAD_TILE_N + i][j] = V[row * d + j];
+                smem[threadIdx.y * THREAD_TILE_M + i][j] = V[row * d + j];
             } else {
-                smem[threadIdx.y * THREAD_TILE_N + i][j] = 0.0f;
+                smem[threadIdx.y * THREAD_TILE_M + i][j] = 0.0f;
             }
         }
     }
@@ -166,40 +166,109 @@ __device__ void matmul_PV(float P[TILE_BR][TILE_BC], float V[TILE_BC][HEAD_DIM],
     }
 }
 
-// Online Softmax (TODO: implement with per-thread-tile operations)
-__device__ float row_max(float S[TILE_BR][TILE_BC], int row) {
-    float max_val = -INFINITY;
-    for (int j = 0; j < TILE_BC; j++) {
-        max_val = fmaxf(max_val, S[row][j]);
+// Online Softmax 
+__device__ float warp_reduce_max(float val) {
+    // Reduce across the 16 threads in the x-dimension
+    // These threads are contiguous in the warp (lanes differ by 1)
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
     }
-    return max_val;
-}
-__device__ float row_sum_exp(float S[TILE_BR][TILE_BC], int row, float max_val) {
-    float l = 0.0f;
-    for (int j = 0; j < TILE_BC; j++) {
-        float val = expf(S[row][j] - max_val);
-        // Write back to S to save re-computation for P @ V
-        // This effectively turns S into P (not normalized) in shared mem
-        S[row][j] = val; 
-        l += val;
-    }
-    return l;
+    return val;
 }
 
-__device__ void softmax_rescale(float O[THREAD_TILE_M][THREAD_TILE_N], float m_old[THREAD_TILE_M], float m_new[THREAD_TILE_M]) {
+__device__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+// Each thread computes max over its 4 columns for each of its 4 rows
+// Returns array of 4 LOCAL maxes (not yet reduced across threads)
+__device__ void local_row_max(float S[TILE_BR][TILE_BC], float m_local[THREAD_TILE_M]) {
+    int row_start = threadIdx.y * THREAD_TILE_M;
+    int col_start = threadIdx.x * THREAD_TILE_N;
+    
+    #pragma unroll
+    for (int i = 0; i < THREAD_TILE_M; i++) {
+        float max_val = -INFINITY;
+        #pragma unroll
+        for (int j = 0; j < THREAD_TILE_N; j++) {
+            max_val = fmaxf(max_val, S[row_start + i][col_start + j]);
+        }
+        m_local[i] = max_val;
+    }
+}
+
+// After getting local max, reduce across threads to get true row max,
+// then compute exp(S - max) and local sum, then reduce sum across threads.
+// Also overwrites S with exp values for use in matmul_PV.
+__device__ void compute_softmax_stats(
+    float S[TILE_BR][TILE_BC],
+    float m_new[THREAD_TILE_M],    // Output: new max for each row
+    float l_new[THREAD_TILE_M]     // Output: new sum for each row
+) {
+    int row_start = threadIdx.y * THREAD_TILE_M;
+    int col_start = threadIdx.x * THREAD_TILE_N;
+    
+    // Step 1: Compute local max for this thread's columns
+    float m_local[THREAD_TILE_M];
+    local_row_max(S, m_local);
+    
+    // Step 2: Reduce to get global row max
+    #pragma unroll
+    for (int i = 0; i < THREAD_TILE_M; i++) {
+        m_new[i] = warp_reduce_max(m_local[i]);
+    }
+    
+    // Step 3: Compute exp(S - max) for this thread's columns and local sum
+    float l_local[THREAD_TILE_M] = {0};
+    #pragma unroll
+    for (int i = 0; i < THREAD_TILE_M; i++) {
+        #pragma unroll
+        for (int j = 0; j < THREAD_TILE_N; j++) {
+            float val = expf(S[row_start + i][col_start + j] - m_new[i]);
+            S[row_start + i][col_start + j] = val;  // Store for matmul_PV
+            l_local[i] += val;
+        }
+    }
+    
+    // Step 4: Reduce to get global row sum
+    #pragma unroll
+    for (int i = 0; i < THREAD_TILE_M; i++) {
+        l_new[i] = warp_reduce_sum(l_local[i]);
+    }
+}
+
+__device__ void softmax_rescale(
+    float O[THREAD_TILE_M][THREAD_TILE_N],
+    float l[THREAD_TILE_M],
+    float m_old[THREAD_TILE_M],
+    float m_new[THREAD_TILE_M]
+) {
+    #pragma unroll
     for (int i = 0; i < THREAD_TILE_M; i++) {
         float scale = expf(m_old[i] - m_new[i]);
+        // Rescale both the output accumulator and the running sum
+        l[i] *= scale;
+        #pragma unroll
         for (int j = 0; j < THREAD_TILE_N; j++) {
             O[i][j] *= scale;
         }
     }
 }
 
-__device__ void softmax_update(float m[THREAD_TILE_M], float l[THREAD_TILE_M], float m_new[THREAD_TILE_M], float l_new[THREAD_TILE_M]) {
+__device__ void softmax_update(
+    float m[THREAD_TILE_M],
+    float l[THREAD_TILE_M],
+    float m_new[THREAD_TILE_M],
+    float l_new[THREAD_TILE_M]
+) {
+    #pragma unroll
     for (int i = 0; i < THREAD_TILE_M; i++) {
-        //combine local sum of current block with the old running sum
-        float scale = expf(m[i] - m_new[i]);
-        l[i] = l[i] * scale + l_new[i];
+        l[i] += l_new[i];  // l was already rescaled in softmax_rescale
         m[i] = m_new[i];
     }
 }
@@ -248,18 +317,28 @@ __global__ void flash_attention_kernel(const float* Q, const float* K, const flo
         load_V_tile(V, smem_V, kv_tile, N, d);
         __syncthreads();
         
-        // TODO: matmul_QKt(smem_Q, smem_K, smem_S);
-        // __syncthreads();
+        matmul_QKt(smem_Q, smem_K, smem_S);
+        __syncthreads();
         
-        // TODO: Compute m_new and l_new for each of THREAD_TILE_M rows
-        // TODO: softmax_rescale(reg_O, m, l, m_new, l_new);
-        // TODO: softmax_update(m, l, m_new, l_new);
+        // Compute softmax stats and overwrite smem_S with exp values
+        float m_new[THREAD_TILE_M];
+        float l_new[THREAD_TILE_M];
+        compute_softmax_stats(smem_S, m_new, l_new);
+        // No sync needed here, each thread only reads/writes its own rows
         
-        // TODO: matmul_PV(smem_S, smem_V, reg_O);
-        // __syncthreads();
+        // Rescale previous output (must happen before updating m)
+        softmax_rescale(reg_O, l, m, m_new);
+        
+        // Update running stats
+        softmax_update(m, l, m_new, l_new);
+        
+        __syncthreads();  // Ensure smem_S writes from compute_softmax_stats are visible
+        
+        matmul_PV(smem_S, smem_V, reg_O);
+        __syncthreads();  // Before next iteration loads new K/V
     }
-    
-    // TODO: store_O(O, reg_O, l, q_tile, N, d);
+
+    store_O(O, reg_O, l, q_tile, N, d);
 }
 
 // Host
