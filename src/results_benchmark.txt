@@ -1,5 +1,0 @@
-Naive Attention MPI Benchmark
-N=1024, d=256, Total Heads=16, MPI Size=4
-Total Execution Time: 337.8 ms
-Verifying Head 0 on CPU...
-Max Error: 8.9407e-08 [PASS]
