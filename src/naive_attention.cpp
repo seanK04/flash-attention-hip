@@ -19,9 +19,9 @@ Algorithm:
 #include <cassert>
 
 // Configuration
-constexpr int N = 1024;       // Sequence Length
-constexpr int d = 256;         // Head Dimension
-constexpr int TOTAL_HEADS = 16; // Total heads to process across all ranks
+constexpr int N = 16384;       // Sequence Length
+constexpr int d = 64;         // Head Dimension
+constexpr int TOTAL_HEADS = 64; // Total heads to process across all ranks
 
 #define HIP_CHECK(cmd) \
     do { \
@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
     }
     int local_heads = TOTAL_HEADS / size;
 
-    size_t size_matrix_small = N * d * sizeof(float);
+    // size_t size_matrix_small = N * d * sizeof(float);
     size_t size_matrix_large = N * N * sizeof(float);
 
     // Host Memory
@@ -170,54 +170,53 @@ int main(int argc, char** argv) {
     for (auto& val : h_K) val = dis(gen);
     for (auto& val : h_V) val = dis(gen);
 
-    // Device Memory
-    // We only need ONE set of buffers on the GPU, we will loop through heads
-    // This simulates processing heads sequentially on one GPU to save memory.
-    // Naive attention uses O(N^2) memory, so we reuse buffers to be safe.
-    float *d_Q, *d_K, *d_V, *d_O; // Small [N, d]
-    float *d_S, *d_P;             // Large [N, N]
+// Device Memory - buffers for ALL local heads
+float *d_Q, *d_K, *d_V, *d_O;
+float *d_S, *d_P;
 
-    HIP_CHECK(hipMalloc(&d_Q, size_matrix_small));
-    HIP_CHECK(hipMalloc(&d_K, size_matrix_small));
-    HIP_CHECK(hipMalloc(&d_V, size_matrix_small));
-    HIP_CHECK(hipMalloc(&d_O, size_matrix_small));
-    HIP_CHECK(hipMalloc(&d_S, size_matrix_large));
-    HIP_CHECK(hipMalloc(&d_P, size_matrix_large));
+size_t size_all_heads = local_heads * N * d * sizeof(float);
 
-    // Synchronize before timing
-    HIP_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    double start_time = MPI_Wtime();
+HIP_CHECK(hipMalloc(&d_Q, size_all_heads));
+HIP_CHECK(hipMalloc(&d_K, size_all_heads));
+HIP_CHECK(hipMalloc(&d_V, size_all_heads));
+HIP_CHECK(hipMalloc(&d_O, size_all_heads));
+HIP_CHECK(hipMalloc(&d_S, size_matrix_large));  // Still just one, reused
+HIP_CHECK(hipMalloc(&d_P, size_matrix_large));  // Still just one, reused
 
-    // Loop over local heads
-    for (int h = 0; h < local_heads; ++h) {
-        // 1. Copy Input for this head
-        HIP_CHECK(hipMemcpy(d_Q, &h_Q[h * N * d], size_matrix_small, hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_K, &h_K[h * N * d], size_matrix_small, hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_V, &h_V[h * N * d], size_matrix_small, hipMemcpyHostToDevice));
+// Copy ALL data to GPU (before timing)
+HIP_CHECK(hipMemcpy(d_Q, h_Q.data(), size_all_heads, hipMemcpyHostToDevice));
+HIP_CHECK(hipMemcpy(d_K, h_K.data(), size_all_heads, hipMemcpyHostToDevice));
+HIP_CHECK(hipMemcpy(d_V, h_V.data(), size_all_heads, hipMemcpyHostToDevice));
 
-        // 2. Kernel 1: S = Q * K^T
-        dim3 block(16, 16);
-        dim3 grid_score((N + 15) / 16, (N + 15) / 16);
-        kernel_score<<<grid_score, block>>>(d_Q, d_K, d_S, N, d);
+HIP_CHECK(hipDeviceSynchronize());
+MPI_Barrier(MPI_COMM_WORLD);
+double start_time = MPI_Wtime();
 
-        // 3. Kernel 2: P = Softmax(S)
-        // One thread per row for simplicity in naive implementation
-        int threads = 256;
-        int blocks = (N + threads - 1) / threads;
-        kernel_softmax<<<blocks, threads>>>(d_S, d_P, N);
+// Kernels only (no memcpy inside loop)
+for (int h = 0; h < local_heads; ++h) {
+    float* Q_head = d_Q + h * N * d;
+    float* K_head = d_K + h * N * d;
+    float* V_head = d_V + h * N * d;
+    float* O_head = d_O + h * N * d;
 
-        // 4. Kernel 3: O = P * V
-        dim3 grid_out((d + 15) / 16, (N + 15) / 16);
-        kernel_value<<<grid_out, block>>>(d_P, d_V, d_O, N, d);
+    dim3 block(16, 16);
+    dim3 grid_score((N + 15) / 16, (N + 15) / 16);
+    kernel_score<<<grid_score, block>>>(Q_head, K_head, d_S, N, d);
 
-        // 5. Copy Output back
-        HIP_CHECK(hipMemcpy(&h_O[h * N * d], d_O, size_matrix_small, hipMemcpyDeviceToHost));
-    }
+    int threads = 256;
+    int blocks_sm = (N + threads - 1) / threads;
+    kernel_softmax<<<blocks_sm, threads>>>(d_S, d_P, N);
 
-    HIP_CHECK(hipDeviceSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-    double end_time = MPI_Wtime();
+    dim3 grid_out((d + 15) / 16, (N + 15) / 16);
+    kernel_value<<<grid_out, block>>>(d_P, V_head, O_head, N, d);
+}
+
+HIP_CHECK(hipDeviceSynchronize());
+MPI_Barrier(MPI_COMM_WORLD);
+double end_time = MPI_Wtime();
+
+// Copy results back (after timing)
+HIP_CHECK(hipMemcpy(h_O.data(), d_O, size_all_heads, hipMemcpyDeviceToHost));
 
     if (rank == 0) {
         std::cout << "Total Execution Time: " << (end_time - start_time) * 1000.0 << " ms" << std::endl;

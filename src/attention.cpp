@@ -37,17 +37,6 @@
  *   4. Write final output (normalized by l)
  */
 
-// Constants
-constexpr int TILE_BR = 64;
-constexpr int TILE_BC = 64;
-constexpr int HEAD_DIM = 64;
-
-// Thread block configuration
-constexpr int THREADS_X = 16;  // columns
-constexpr int THREADS_Y = 16;  // rows
-constexpr int THREAD_TILE_M = TILE_BR / THREADS_Y;  // 4 rows per thread
-constexpr int THREAD_TILE_N = TILE_BC / THREADS_X;  // 4 cols per thread
-
 // Tile Loading
 __device__ void load_Q_tile(const float* Q, float smem[TILE_BR][HEAD_DIM], int tile_idx, int N, int d) {
     // Each thread loads THREAD_TILE_M rows
@@ -172,7 +161,7 @@ __device__ float warp_reduce_max(float val) {
     // These threads are contiguous in the warp (lanes differ by 1)
     #pragma unroll
     for (int offset = 8; offset > 0; offset >>= 1) {
-        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
+        val = fmaxf(val, __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, val, offset));
     }
     return val;
 }
@@ -180,7 +169,7 @@ __device__ float warp_reduce_max(float val) {
 __device__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 8; offset > 0; offset >>= 1) {
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        val += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFULL, val, offset);
     }
     return val;
 }
@@ -343,7 +332,12 @@ __global__ void flash_attention_kernel(const float* Q, const float* K, const flo
 
 // Host
 void flash_attention_forward(const float* Q, const float* K, const float* V, float* O, int N, int d) {
+    // Grid dimension: one block per Q tile
     dim3 grid((N + TILE_BR - 1) / TILE_BR);
-    dim3 block(THREADS_X, THREADS_Y);  // 16x16 = 256 threads per block
+    
+    // Block dimension: 16 x 16 = 256 threads
+    dim3 block(THREADS_X, THREADS_Y);
+    
+    // Launch kernel
     hipLaunchKernelGGL(flash_attention_kernel, grid, block, 0, 0, Q, K, V, O, N, d);
 }
